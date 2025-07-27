@@ -1,58 +1,50 @@
 # Oracle Linux 9.6 on the Mac Pro 6,1 (“Trash-Can”)
-*A step-by-step field guide — EFI fixes, GPU work-arounds, and homelab tips*
-
-<p align="center">
-  <img src="docs/img/trashcan_macpro.jpg" width="320" alt="Mac Pro 6,1">
-</p>
+*A proven walk-through that mirrors the exact steps we used to get a clean, bootable system.*
 
 ---
 
 ## 📑 Table of Contents
-1. [Why This Is Tricky](#-why-this-is-tricky)  
-2. [What You’ll Need](#-what-youll-need)  
-3. [Step-by-Step Install (UEFI Text Mode)](#-step-by-step-install-uefi-text-mode)  
-4. [Post-Install Fixes](#-post-install-fixes)  
+1. [Why This Is Difficult](#-why-this-is-difficult)  
+2. [Prerequisites](#-prerequisites)  
+3. [Installation — the **No-Boot-Loader** method](#-installation—the-no-boot-loader-method)  
+4. [Post-Install Tasks](#-post-install-tasks)  
 5. [Troubleshooting FAQ](#-troubleshooting-faq)  
 6. [Outcome & Next Steps](#-outcome--next-steps)  
-7. [References & Links](#-references--links)
+7. [References](#-references)
 
 ---
 
-## 🔍 Why This Is Tricky
+## 🔍 Why This Is Difficult
 
 | Quirk | Impact |
 |-------|--------|
-| **Apple “macEFI” GUID** | Anaconda’s storage module can’t re-format Apple’s proprietary EFI slice → endless *“resource to create format ‘macefi’ unavailable”* loop. |
-| **GRUB vs. Apple firmware** | Must wipe old GPT/APFS metadata **and** skip the `mactel-boot` step, then manually generate `grub.cfg`. |
-| **FirePro D700 stalls** | Legacy **radeon** driver sometimes locks the console. Need `nomodeset` or force **amdgpu**. |
-| **Broadcom Wi-Fi** | BCM4360 requires proprietary **wl** driver; must be compiled for UEK. |
-| **Headless install** | Use **text-mode** to avoid GUI lock-ups and enable SSH early. |
+| **Apple “macEFI” GUID** | Anaconda can’t re-format the proprietary Apple EFI slice → *“resource to create format ‘macefi’ unavailable”*. |
+| **mactel-boot package missing** | The installer throws an error unless you disable boot-loader installation. |
+| **FirePro D700 (Tahiti) stalls** | The legacy `radeon` driver can hang early boot; we use `nomodeset` during install and later switch to `amdgpu`. |
+| **Wi-Fi (BCM4360)** | Needs proprietary **wl** driver — best compiled later. |
+| **Headless installs** | Text mode avoids GUI lock-ups and allows rescue via console. |
 
 ---
 
-## 🛠️ What You’ll Need
+## 🛠️ Prerequisites
 
-| Item | Details |
-|------|---------|
-| **Oracle Linux 9.6 ISO** | `OracleLinux-R9-U6-x86_64-boot.iso` |
-| **≥16 GB USB** | Flash with `dd`:<br>`sudo dd if=OracleLinux*.iso of=/dev/sdX bs=4M status=progress && sync` |
-| **Wired Ethernet** | Wi-Fi configured later. |
-| **Keyboard + monitor** | Plugged into Mac Pro for the install. |
-| **(Optional) WoL MAC** | Needed only if you’ll wake a remote GPU box. |
-
-**Firmware checklist**
-
-1. macOS Recovery ▶ **Startup Security Utility** ▶ *Allow booting from external media*.  
-2. PCIe Wake-on-LAN **enabled** (if you plan WoL).  
-3. No other changes to SIP or Secure Boot are required.
+| Item | Notes |
+|------|-------|
+| **Oracle Linux 9.6 Boot ISO** | `OracleLinux-R9-U6-x86_64-boot.iso` |
+| **USB (≥16 GB)** | Flash with `dd`:<br>`sudo dd if=OracleLinux*.iso of=/dev/sdX bs=4M status=progress && sync` |
+| **Ethernet cable** | Wired first; Wi-Fi later. |
+| **Keyboard & monitor** | Needed for the Mac Pro during install. |
+| **Firmware prep** | Startup Security Utility → *Allow booting from external media*. |
 
 ---
 
-## 🚀 Step-by-Step Install (UEFI Text Mode)
+## 🚀 Installation — the **No-Boot-Loader** method
 
-> **TL;DR**  Wipe GPT → Automatic partitioning → Skip boot-loader → rescue shell → `grub2-mkconfig`.
+_These are the exact steps we confirmed work (adapted from Bugzilla Comment 16)._
 
-### 1  Boot text installer
+> **Big picture**: Boot text-mode → tell the installer **not** to install a boot loader → manually create a fresh 600 MB EFI slice → finish install → rescue shell → `grub2-mkconfig`.
+
+### 1 Boot the text installer
 
 ```text
 ⌥  →  EFI Boot → highlight “Install Oracle Linux” →  e
@@ -60,52 +52,59 @@ linuxefi … append:
    inst.text nomodeset radeon.modeset=0
 Ctrl-X
 
-2  Open shell → wipe Apple GPT
+2 Normal install-hub tasks
 
-# Press “2 – Shell” in the text menu
-lsblk -d                      # find SSD (usually /dev/sda)
-dd if=/dev/zero of=/dev/sda bs=1M count=16
-parted /dev/sda --script mklabel gpt
-exit
+Set network, locale, packages as usual.
 
-3  Automatic partitioning
+3 Disk partitioning — turn off boot loader
+	1.	Installation Destination → select your SSD.
+	2.	At the bottom click “Full disk summary and boot loader”.
+	•	Select the disk.
+	•	Click Do not install boot loader → Close.
+	3.	Back on Storage Configuration, choose Custom → Done.
 
-5 → Installation Destination
-[X] /dev/sda   |   Automatic partitioning   |   Delete all on selected drives
-c → w
+4 Manual partition layout
+	1.	Delete old Mac partitions if present.
+	2.	Click + to add partitions:
 
-Installer creates:
+Mount Point	Size	Device Type	File System
+/boot/efi	600 MB	Standard Partition	EFI System Partition
+/boot	1 GB	Standard Partition	ext4
+/	(rest)	LVM (default)	xfs
+swap	4–8 GB	LVM	swap
 
-Device	Size	Mount	FS
-/dev/sda1	200 MiB	/boot/efi	vfat
-/dev/sda2	1 GiB	/boot	ext4
-LVM VG ol	rest	/ (xfs) + swap	xfs
+Tip: If you hit size limits (e.g., 500 GB disk) shrink /home or / a bit first, then add the new /boot/efi.
 
-When mactel-boot missing appears, press Ignore.
+	3.	Done → Apply Changes.
 
-4  Finalize installer
-	•	Set root password
-	•	Create wheel user (check “Make this user administrator”)
-	•	b – Begin Installation ▪ wait ≈5 min.
+5 Begin installation
+	•	Ignore the red mactel-boot missing warning → click Yes/Ignore.
+	•	Installation completes, reboots; you’ll land at a minimal grub> prompt (no grub.cfg yet) — that’s expected.
 
-5  Rescue GRUB (first reboot)
-	1.	Mac reboots to grub> minimal shell → insert USB → choose Troubleshooting ▶ Rescue → option 1 (mount RW).
-	2.	Generate config:
+6 Rescue shell → generate grub.cfg
+	1.	Boot the ISO again → Troubleshooting → Rescue a Red Hat Enterprise Linux system → option 1 (mount on /mnt/sysimage).
+	2.	At the shell:
 
-chroot /mnt/sysroot
+chroot /mnt/sysimage
+# sanity-check:
+ls -l /boot/ /boot/efi/EFI/redhat
+# write config:
 grub2-mkconfig -o /boot/efi/EFI/redhat/grub.cfg
 exit
 reboot
 
-Hold ⌥, pick Oracle Linux. GRUB menu appears ✅.
+Ignore harmless reload ioctl messages.
+
+7 First SELinux relabel & login
+	•	After the SELinux relabel reboot, log in as your wheel user (GUI or console).
 
 ⸻
 
-🔧 Post-Install Fixes
+🔧 Post-Install Tasks
 
-A. Switch D700 to amdgpu
+A. Switch to amdgpu (remove nomodeset)
 
-sudo tee /etc/modprobe.d/amdgpu.conf <<'EOF'
+sudo tee /etc/modprobe.d/amdgpu.conf >/dev/null <<'EOF'
 options amdgpu si_support=1 cik_support=0
 blacklist radeon
 options radeon modeset=0
@@ -122,19 +121,15 @@ sudo passwd -l root
 sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 sudo systemctl reload sshd
 
-C. (Optional) Build Broadcom Wi-Fi wl driver
+C. (Optional) Build Broadcom Wi-Fi driver
 
 sudo dnf install -y dkms gcc make kernel-uek-devel-$(uname -r)
-
 curl -L -o wl.tar.gz \
   https://www.broadcom.com/docs/linux_sta/hybrid-portsrc_x86_64-v5_100_82_112.tar.gz
-
 tar xzf wl.tar.gz && cd hybrid-portsrc_x86_64-*
 make && sudo make install
-
 echo -e "blacklist b43\nblacklist bcma\nblacklist brcmsmac\nblacklist ssb" | \
   sudo tee /etc/modprobe.d/broadcom-blacklist.conf
-
 sudo dracut -f --kver "$(uname -r)"
 sudo reboot
 
@@ -143,35 +138,32 @@ sudo reboot
 
 ❓ Troubleshooting FAQ
 
-Symptom	Fix
-“failed to save storage configuration” loop	You skipped the wipe. Boot USB, run dd + parted mklabel gpt again.
-Stuck at Apple prohibitory icon	grub.cfg missing. Rescue → grub2-mkconfig.
-Black screen after GRUB	Keep nomodeset, then migrate to amdgpu.
-Wi-Fi absent	Build proprietary wl driver as shown above.
-Cannot SSH as root	That’s intended — use your wheel account + sudo.
+Symptom	Remedy
+“failed to save storage configuration” loop	You forgot the Do not install boot loader toggle or didn’t wipe GPT.
+Stuck at prohibitory icon	grub.cfg missing → rescue shell → grub2-mkconfig.
+Black console after GRUB	Keep nomodeset until you switch to amdgpu.
+Wi-Fi absent	Compile wl driver (see above) or stay on Ethernet.
 
 
 ⸻
 
 🎯 Outcome & Next Steps
-	•	Oracle Linux 9.6 boots natively on Mac Pro 6,1 with a standard UEFI GRUB.
-	•	FirePro D700 runs on amdgpu (or safe nomodeset fallback).
-	•	System ready for Podman / Docker, OpenWebUI, Ollama on a remote GPU box, etc.
-	•	Optional Wake-on-LAN proxy lets a gaming PC with RTX 3090 spin up only when AI is requested.
+	•	Oracle Linux 9.6 boots natively via a standard EFI System Partition.
+	•	FirePro D700 uses amdgpu (or safe nomodeset).
+	•	Root logins disabled; wheel user via sudo.
+	•	Ready for Podman / Docker, OpenWebUI, and remote GPU endpoints (Ollama on a 3090 gaming PC).
 
 ⸻
 
-📚 References & Links
-	•	RH Bug 1751311 — mactel-boot installer loop
+📚 References
+	•	Red Hat Bug 1751311 – mactel-boot loop
 https://bugzilla.redhat.com/show_bug.cgi?id=1751311#c16
-	•	Broadcom STA driver download
+	•	Broadcom STA driver
 https://www.broadcom.com/support/download-search?pf=Wireless+LAN+Infrastructure
-	•	Oracle Linux documentation
+	•	Oracle Linux docs
 https://docs.oracle.com/en/operating-systems/
-	•	AMD GPU Linux support matrix
-https://rocm-documentation.readthedocs.io/
 
 ⸻
 
-License & Authorship — MIT License • Contributions welcome • Created 2025
+License: MIT • Author: Your Name  • PRs welcome!
 
